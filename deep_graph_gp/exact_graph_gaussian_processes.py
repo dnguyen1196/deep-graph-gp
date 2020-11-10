@@ -4,7 +4,7 @@ import dgl
 import gpytorch
 from gpytorch.models import ExactGP
 from gpytorch.distributions import MultivariateNormal
-
+from gpytorch.lazy import lazify, delazify
 
 class ExactGraphGP(ExactGP):
     def __init__(self, likelihood, mean, kernel):
@@ -21,15 +21,20 @@ class ExactGraphGP(ExactGP):
 
         mean = self.mean_module(x)
         cov  = self.covar_module(x)
-        adj = dgl.khop_adj(g, 1) # Adjacency matrix
-        d   = g.out_degrees() # Degree vector
-        n   = adj.shape[0]
+        cov.add_jitter()
 
-        a_plus_i = adj + torch.eye(n)
-        
-        m = torch.dot(a_plus_i, mean) / (d[:, None]+1)
+        adj = g.adjacency_matrix(False) # Adjacency matrix
+        d   = g.out_degrees().float() # Degree vector
+        n   = adj.shape[0]    # Number of vertices
 
-        S = (a_plus_i @ cov) @ a_plus_i
-        S = S * torch.outer(d +1, d+1)
+        a_plus_i = torch.eye(n) + adj
+        m = torch.matmul(a_plus_i, mean.view(mean.numel(),1))
+        m /= (d.view(d.numel(),1) + 1.)
 
+        S = delazify(cov)
+
+        S = torch.matmul(a_plus_i, torch.matmul(S, a_plus_i.T))
+        # print(S)
+        # print(torch.cholesky(S))
+        S = S * (torch.ger(1./(d+1.), 1./(d+1.)))
         return MultivariateNormal(m, S)

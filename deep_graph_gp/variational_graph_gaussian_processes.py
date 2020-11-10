@@ -5,18 +5,19 @@ import gpytorch
 from gpytorch.models import ApproximateGP
 from gpytorch.variational import CholeskyVariationalDistribution
 from gpytorch.variational import VariationalStrategy
-from gpytorch.variational import _VariationalStrategy
 from gpytorch.distributions import MultivariateNormal
 from gpytorch.lazy import DiagLazyTensor, MatmulLazyTensor, RootLazyTensor,\
-    SumLazyTensor, delazify
+    SumLazyTensor, delazify, lazify
 
 """
 
+Checkout
+
 """
 
-class GraphVariationalStrategy(_VariationalStrategy):
+class GraphVariationalStrategy(VariationalStrategy):
     def __init__(self, model, inducing_points, variational_distribution):
-        super(GraphVariationalStrategy).__init__(model, 
+        super(GraphVariationalStrategy, self).__init__(model,
             inducing_points, variational_distribution, True)
     
     def forward(self, g, x, inducing_points, inducing_values, variational_inducing_covar):
@@ -45,26 +46,31 @@ class GraphVariationalStrategy(_VariationalStrategy):
             self.model.covar_module(full_inputs)
         )
 
-        full_covar = full_output.lazy_covariance_matrix
-        full_mean = full_output.mean
+        full_covar = delazify(full_output.lazy_covariance_matrix)
+        full_mean  = full_output.mean.float()
         
-        adj = dgl.khop_adj(g, 1) # Adjacency matrix
+        adj = g.adjacency_matrix(False).to_dense() # Adjacency matrix
         nnz = inducing_points.size(-2) # Number of inducing points
         nnx = adj.shape[0] # Number of test point
+
         A_tilde_upper_half = torch.cat([torch.zeros(nnz, nnz), torch.zeros(nnz, nnx)], dim=-1)
         A_tilde_lower_half = torch.cat([torch.zeros(nnx, nnz), adj], dim=-1)
         A = torch.cat([A_tilde_upper_half, A_tilde_lower_half], dim=-2)
+
         A_plus_i = A + np.eye(nnz + nnx)
+        A_plus_i.float()
 
-        d   = torch.cat([torch.zeros(nnz), g.out_degrees()]) # Degree vector
-        full_mean = torch.dot(A_plus_i, full_mean) / (d[:, None]+1)
+        d   = torch.cat([torch.zeros(nnz), g.out_degrees().float()]) # Degree vector
+        full_mean = torch.matmul(A_plus_i.float(), full_mean.view(nnz+nnx,1))
+        full_mean /= (d.view(d.numel(),1) + 1.)
 
-        S = (A_plus_i @ full_covar) @ A_plus_i
-        full_covar = S * torch.outer(d+1, d+1)
+        S = torch.matmul(A_plus_i.float(), torch.matmul(full_covar, A_plus_i.T.float()))
+        full_covar = S * torch.ger(1/(d+1.), 1/(d+1.))
+        full_covar = lazify(full_covar)
 
         # Covariance terms
         num_induc = inducing_points.size(-2)
-        test_mean = full_mean[..., num_induc:]
+        test_mean = full_mean[num_induc:]
 
         induc_induc_covar = full_covar[..., :num_induc, :num_induc].add_jitter()
         induc_data_covar = full_covar[..., :num_induc, num_induc:].evaluate()
@@ -89,7 +95,7 @@ class GraphVariationalStrategy(_VariationalStrategy):
                 interp_term.transpose(-1, -2),
                 (inducing_values - self.prior_distribution.mean).unsqueeze(-1)
             ).squeeze(-1)
-            + test_mean
+            + test_mean.squeeze(-1)
         )
 
         # Compute the covariance of q(f)
@@ -104,31 +110,21 @@ class GraphVariationalStrategy(_VariationalStrategy):
 
         # Return the distribution
         return MultivariateNormal(predictive_mean, predictive_covar)
-    
-    def prior_distribution(self):
-        """
-        The :func:`~gpytorch.variational.VariationalStrategy.prior_distribution` method determines how to compute the
-        GP prior distribution of the inducing points, e.g. :math:`p(u) \sim N(\mu(X_u), K(X_u, X_u))`. Most commonly,
-        this is done simply by calling the user defined GP prior on the inducing point data directly.
-        :rtype: :obj:`~gpytorch.distributions.MultivariateNormal`
-        :return: The distribution :math:`p( \mathbf u)`
-        """
-        mean = self.model.mean_module(self.inducing_points)
-        cov  = self.model.covar_module(self.inducing_points)
-        return MultivariateNormal(mean, cov)
-
 
 class VariationalGraphGP(ApproximateGP):
     def __init__(self, inducing_points, mean, covar):
-        self.variational_distribution = CholeskyVariationalDistribution(inducing_points.size(0))
+        variational_distribution = CholeskyVariationalDistribution(inducing_points.size(0))
+
         variational_strategy = GraphVariationalStrategy(self, inducing_points, 
-            self.variational_distribution)
+            variational_distribution)
         
         super(VariationalGraphGP, self).__init__(variational_strategy)
 
+        self.variational_distribution = variational_distribution
         # The mean of the graph GP will be different as well!
         self.mean_module = mean
         self.covar_module = covar
+        self.inducing_points = inducing_points
 
     def forward(self, g, x=None):
         """
@@ -141,6 +137,6 @@ class VariationalGraphGP(ApproximateGP):
         if x is None:
             x = g.ndata["h"]
             
-        return self.variational_strategy(g, x, self.inducing_points,
+        return self.variational_strategy.forward(g, x, self.inducing_points,
             q_u.mean, q_u.lazy_covariance_matrix)
-    
+

@@ -4,6 +4,9 @@ import dgl
 from scipy.io import loadmat
 import torch
 
+
+# Note also that we also have this https://docs.dgl.ai/api/python/dgl.data.html#module-dgl.data
+
 dataset_folder = os.path.dirname(os.path.realpath(__file__)) + "/datasets"
 
 def cerebellum():
@@ -219,5 +222,27 @@ def pubmed():
             citing_node_id = pub_ids_to_node_ids[citing_pub_id]
             cited_node_id = pub_ids_to_node_ids[cited_pub_id]
             g.add_edge(cited_node_id, citing_node_id)
+
+    return g
+
+
+def random_graph(n, hidden_dim, f):
+
+    # Generate a random graph g
+    g = dgl.rand_graph(n, int(n * np.log(n)))
+
+    random_features = torch.rand(n, hidden_dim)
+
+    g.ndata["h"] = random_features
+
+    print(random_features.shape)
+
+    adj = g.adjacency_matrix(False)
+    d = g.out_degrees()
+
+    h = f(random_features)
+    y = adj @ h / (d[:, None] + 1)
+
+    g.ndata["y"] = y.flatten()
 
     return g

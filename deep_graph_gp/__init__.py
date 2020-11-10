@@ -1,2 +1,5 @@
 import deep_graph_gp
 import deep_graph_gp.data
+from deep_graph_gp.exact_graph_gaussian_processes import ExactGraphGP
+from deep_graph_gp.variational_graph_gaussian_processes import VariationalGraphGP
+from deep_graph_gp.sparse_graph_gaussian_processes import SparseGraphGP
