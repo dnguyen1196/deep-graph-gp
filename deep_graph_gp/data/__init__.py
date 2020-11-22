@@ -226,23 +226,45 @@ def pubmed():
     return g
 
 
-def random_graph(n, hidden_dim, f):
-
+def random_graph(n, hidden_dim, f, sigma_noise=None):
     # Generate a random graph g
-    g = dgl.rand_graph(n, int(n * np.log(n)))
-
+    g0 = dgl.rand_graph(n, int(n * np.log(n)))
     random_features = torch.rand(n, hidden_dim)
+    g0.ndata["h"] = random_features
 
-    g.ndata["h"] = random_features
+    # Make sure that it's symmetric
+    adj = g0.adjacency_matrix(False).to_dense()
+    adj = adj + torch.eye(n)
+    adj = torch.maximum(adj, adj.transpose(0,1))
 
-    print(random_features.shape)
-
-    adj = g.adjacency_matrix(False)
-    d = g.out_degrees()
-
+    d = g0.out_degrees()
     h = f(random_features)
+
     y = adj @ h / (d[:, None] + 1)
+    if sigma_noise is not None:
+        y += np.random.normal(0, sigma_noise, y.shape)
 
-    g.ndata["y"] = y.flatten()
+    g = dgl.DGLGraph()
+    g.add_nodes(n, {"h" : g0.ndata["h"]})
+    for i in range(adj.shape[0]):
+        for j in range(adj.shape[1]):
+            if adj[i,j] == 1:
+                g.add_edge(i, j)
 
-    return g
+    if y.ndim == 2 and y.shape[1] > 1:
+        num_classes = y.shape[1]
+        y = np.argmax(y, axis=1)
+        g.ndata["y"] = y
+    else:
+        g.ndata["y"] = y.flatten()
+
+    # 
+    n_train = int(n*0.2)
+    mask = np.zeros((n,))
+    mask[:n_train] = 1
+    np.random.shuffle(mask)
+
+    train_mask = mask == 1
+    test_mask  = mask == 0
+
+    return g, train_mask, test_mask

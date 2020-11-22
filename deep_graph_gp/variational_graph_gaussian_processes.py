@@ -2,141 +2,143 @@ import torch
 import numpy as np
 import dgl
 import gpytorch
-from gpytorch.models import ApproximateGP
+from gpytorch.kernels import RBFKernel, ScaleKernel
+from gpytorch.means import ConstantMean, LinearMean
 from gpytorch.variational import CholeskyVariationalDistribution
-from gpytorch.variational import VariationalStrategy
-from gpytorch.distributions import MultivariateNormal
-from gpytorch.lazy import DiagLazyTensor, MatmulLazyTensor, RootLazyTensor,\
-    SumLazyTensor, delazify, lazify
+from gpytorch.variational import VariationalStrategy, IndependentMultitaskVariationalStrategy
+from gpytorch.distributions import MultivariateNormal, MultitaskMultivariateNormal
+from gpytorch.lazy import lazify
+from torch_sparse.tensor import SparseTensor
+from gpytorch.models.deep_gps import DeepGPLayer
+from gpytorch import settings
+from gpytorch.lazy import BlockDiagLazyTensor
+from gpytorch.models import ApproximateGP
 
 """
+How do we avoid using the entire adjacency matrix in our calculation?
 
-Checkout
+Can we instead of passing in the entire adjacency matrix of the original
+graph, pass in the subgraph (during batch) training?
 
 """
-
-class GraphVariationalStrategy(VariationalStrategy):
-    def __init__(self, model, inducing_points, variational_distribution):
-        super(GraphVariationalStrategy, self).__init__(model,
-            inducing_points, variational_distribution, True)
-    
-    def forward(self, g, x, inducing_points, inducing_values, variational_inducing_covar):
-        """
-        The :func:`~gpytorch.variational.VariationalStrategy.forward` method determines how to marginalize out the
-        inducing point function values. Specifically, forward defines how to transform a variational distribution
-        over the inducing point values, :math:`q(u)`, in to a variational distribution over the function values at
-        specified locations x, :math:`q(f|x)`, by integrating :math:`\int p(f|x, u)q(u)du`
-        :param dgl.DGLGraph g: A graph or sampled subgraph
-        :param torch.Tensor x: Locations :math:`\mathbf X` to get the
-            variational posterior of the function values at.
-        :param torch.Tensor inducing_points: Locations :math:`\mathbf Z` of the inducing points
-        :param torch.Tensor inducing_values: Samples of the inducing function values :math:`\mathbf u`
-            (or the mean of the distribution :math:`q(\mathbf u)` if q is a Gaussian.
-        :param ~gpytorch.lazy.LazyTensor variational_inducing_covar: If the distribuiton :math:`q(\mathbf u)`
-            is Gaussian, then this variable is the covariance matrix of that Gaussian. Otherwise, it will be
-            :attr:`None`.
-        :rtype: :obj:`~gpytorch.distributions.MultivariateNormal`
-        :return: The distribution :math:`q( \mathbf f(\mathbf X))`
-        """
-        # Compute full prior distribution
-        full_inputs = torch.cat([inducing_points, x], dim=-2)
-        
-        full_output = MultivariateNormal(
-            self.model.mean_module(full_inputs),
-            self.model.covar_module(full_inputs)
-        )
-
-        full_covar = delazify(full_output.lazy_covariance_matrix)
-        full_mean  = full_output.mean.float()
-        
-        adj = g.adjacency_matrix(False).to_dense() # Adjacency matrix
-        nnz = inducing_points.size(-2) # Number of inducing points
-        nnx = adj.shape[0] # Number of test point
-
-        A_tilde_upper_half = torch.cat([torch.zeros(nnz, nnz), torch.zeros(nnz, nnx)], dim=-1)
-        A_tilde_lower_half = torch.cat([torch.zeros(nnx, nnz), adj], dim=-1)
-        A = torch.cat([A_tilde_upper_half, A_tilde_lower_half], dim=-2)
-
-        A_plus_i = A + np.eye(nnz + nnx)
-        A_plus_i.float()
-
-        d   = torch.cat([torch.zeros(nnz), g.out_degrees().float()]) # Degree vector
-        full_mean = torch.matmul(A_plus_i.float(), full_mean.view(nnz+nnx,1))
-        full_mean /= (d.view(d.numel(),1) + 1.)
-
-        S = torch.matmul(A_plus_i.float(), torch.matmul(full_covar, A_plus_i.T.float()))
-        full_covar = S * torch.ger(1/(d+1.), 1/(d+1.))
-        full_covar = lazify(full_covar)
-
-        # Covariance terms
-        num_induc = inducing_points.size(-2)
-        test_mean = full_mean[num_induc:]
-
-        induc_induc_covar = full_covar[..., :num_induc, :num_induc].add_jitter()
-        induc_data_covar = full_covar[..., :num_induc, num_induc:].evaluate()
-        data_data_covar = full_covar[..., num_induc:, num_induc:]
-
-        # Compute interpolation terms
-        # K_ZZ^{-1/2} K_ZX
-        # K_ZZ^{-1/2} \mu_Z
-        L = self._cholesky_factor(induc_induc_covar)
-        if L.shape != induc_induc_covar.shape:
-            # Aggressive caching can cause nasty shape incompatibilies when evaluating with different batch shapes
-            del self._memoize_cache["cholesky_factor"]
-            L = self._cholesky_factor(induc_induc_covar)
-        interp_term = torch.triangular_solve(
-            induc_data_covar.double(), L, upper=False)[0].to(full_inputs.dtype)
-
-        # Compute the mean of q(f)
-        # Why K_ZZ^{-1/2}
-        # k_XZ K_ZZ^{-1/2} (m - K_ZZ^{-1/2} \mu_Z) + \mu_X
-        predictive_mean = (
-            torch.matmul(
-                interp_term.transpose(-1, -2),
-                (inducing_values - self.prior_distribution.mean).unsqueeze(-1)
-            ).squeeze(-1)
-            + test_mean.squeeze(-1)
-        )
-
-        # Compute the covariance of q(f)
-        # K_XX + k_XZ K_ZZ^{-1/2} (S - I) K_ZZ^{-1/2} k_ZX 
-        middle_term = self.prior_distribution.lazy_covariance_matrix.mul(-1)
-        middle_term = SumLazyTensor(variational_inducing_covar, middle_term)
-
-        predictive_covar = SumLazyTensor(
-            data_data_covar.add_jitter(1e-4),
-            MatmulLazyTensor(interp_term.transpose(-1, -2), middle_term @ interp_term),
-        )
-
-        # Return the distribution
-        return MultivariateNormal(predictive_mean, predictive_covar)
 
 class VariationalGraphGP(ApproximateGP):
-    def __init__(self, inducing_points, mean, covar):
-        variational_distribution = CholeskyVariationalDistribution(inducing_points.size(0))
+    def __init__(self, inducing_points, in_dim, out_dim=None, mean=None, covar=None, is_output_layer=True):
+        """[summary]
 
-        variational_strategy = GraphVariationalStrategy(self, inducing_points, 
-            variational_distribution)
+        :param inducing_points: [description]
+        :type inducing_points: [type]
+        :param mean: [description]
+        :type mean: [type]
+        :param covar: [description]
+        :type covar: [type]
+        :param num_output_dim: [description]
+        :type num_output_dim: [type]
+        :param full_x: [description], defaults to None
+        :type full_x: [type], optional
+        :param sparse_adj_mat: [description], defaults to None
+        :type sparse_adj_mat: [type], optional
+        """
+    
+        if out_dim is None:
+            batch_shape = torch.Size([])
+        else:
+            batch_shape = torch.Size([out_dim])
         
+        variational_distribution = CholeskyVariationalDistribution(
+            inducing_points.size(-2), 
+            batch_shape=batch_shape
+        )
+
+        # LMCVariationalStrategy for introducing correlation among tasks
+        variational_strategy = IndependentMultitaskVariationalStrategy(
+            VariationalStrategy(
+                self, inducing_points, variational_distribution, learn_inducing_locations=True
+            ),
+            num_tasks=out_dim,
+        )
+
         super(VariationalGraphGP, self).__init__(variational_strategy)
 
-        self.variational_distribution = variational_distribution
-        # The mean of the graph GP will be different as well!
-        self.mean_module = mean
-        self.covar_module = covar
-        self.inducing_points = inducing_points
+        self.mean_module = gpytorch.means.ConstantMean(batch_shape=batch_shape) if mean is None else mean
+        self.covar_module = gpytorch.kernels.PolynomialKernel(power=3, batch_shape=batch_shape) if covar is None else covar
+        self.num_inducing = inducing_points.size(-2)
+        self.is_output_layer = is_output_layer
 
-    def forward(self, g, x=None):
-        """
-        :param 
-        :param 
-        :rtype: :obj:`~gpytorch.distributions.MultivariateNormal`
-        :return: The distribution :math:`q( \mathbf f(\mathbf X))`
-        """
-        q_u = self.variational_distribution.forward()
-        if x is None:
-            x = g.ndata["h"]
-            
-        return self.variational_strategy.forward(g, x, self.inducing_points,
-            q_u.mean, q_u.lazy_covariance_matrix)
+    def sparse_adj_matmul(self, adj, v):
+        """[summary]
 
+        :param adj: [description]
+        :type adj: [type]
+        :param v: [description]
+        :type v: [type]
+        :return: [description]
+        :rtype: [type]
+        """
+        return adj.matmul(v)
+
+    def forward(self, x, g=None, x_inds=None):
+        """[summary]
+
+        :param x: [description]
+        :type x: [type]
+        :param g: [description]
+        :type g: [dlg.DGLGraph]
+        :param x_inds: [description], defaults to None
+        :type x_inds: [type], optional
+        :return: [description]
+        :rtype: [type]
+        """
+        
+        inducing_points = x[..., :self.num_inducing, :]
+        inputs = x[..., self.num_inducing:, :]
+
+        covar_zz = self.covar_module(inducing_points).evaluate()
+
+        # all_x = x[..., self.num_inducing:, :].repeat(self.num_output_dim, 1, 1)
+        # Pre-compute (I+D)^{-1} (A+I) (multiply each row of A+I with (1+di)^-1)
+        adj_mat_filled_diag = SparseTensor.from_torch_sparse_coo_tensor(g.adjacency_matrix(False)).fill_diag(1.)
+        adj_mat_filled_diag = adj_mat_filled_diag / adj_mat_filled_diag.sum(-1).unsqueeze(-1) # Divide each row by (1+di)
+
+        # This will be of shape [num_output_dim, nx, nx] -> Prohibitive for big nx
+        covar_xx_full = self.covar_module(inputs).evaluate()
+
+        # This will be of shape [num_output_dim, nx, nz] -> Prohibitive for big nx
+        covar_xz_full = self.covar_module(inputs, inducing_points).evaluate()
+
+        # covar_xx = (I+D)^{-1} (A+I) K_xx (A+I)^top (I+D)^{-1}
+        # First compute  (I+D)^{-1} (A+I) @ K_xx
+        xx_t1 = self.sparse_adj_matmul(adj_mat_filled_diag, covar_xx_full)
+        # Then compute  (I+D)^{-1} (A+I) @ ((A+I) @ K_xx).T = (A+I) @ K_xx @ (A+I).T
+        xx_t2 = self.sparse_adj_matmul(adj_mat_filled_diag, xx_t1.transpose(-2, -1))
+
+        # covar_xz = (I+D)^{-1} (A+I) K_xz
+        xz_t1 = self.sparse_adj_matmul(adj_mat_filled_diag, covar_xz_full)
+        
+        # xx_t2 is shape [num_output_dim, nx, nx]
+        # The following extracts the corresponding sub-tensor of shape
+        # xx_t2[..., x_inds, :] will have shape [num_output_dim, len(x_inds), nx]
+        # Then covar_xx will have shape
+        # [num_output_dim, nx_batch, nx_batch]
+        # If x_inds is None then 
+        if x_inds is not None:
+            covar_xx = xx_t2[..., x_inds, :][..., :, x_inds]
+            covar_xz = xz_t1[..., x_inds, :]
+        else:
+            covar_xx = xx_t2[..., :, :]
+            covar_xz = xz_t1[..., :, :]
+
+        # Construct the covariance matrix
+        covar_full = gpytorch.lazify(torch.cat([
+                torch.cat([covar_zz, covar_xz.transpose(-2, -1)], dim=-1), 
+                torch.cat([covar_xz, covar_xx], dim=-1)
+            ], dim=-2)).add_jitter(1e-3)
+        
+        if x_inds is None:
+            mean_full = self.mean_module(x)
+        else:
+            mean_full = self.mean_module(torch.cat([
+                inducing_points, inputs[..., x_inds, :]
+            ], dim=-2))
+
+        return gpytorch.distributions.MultivariateNormal(mean_full, covar_full)
