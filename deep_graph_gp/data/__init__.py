@@ -3,6 +3,7 @@ import numpy as np
 import dgl
 from scipy.io import loadmat
 import torch
+from .dataset import *
 
 
 # Note also that we also have this https://docs.dgl.ai/api/python/dgl.data.html#module-dgl.data

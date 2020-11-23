@@ -85,7 +85,6 @@ class DeeplGraphGPLayer(DeepGPLayer):
         :return: [description]
         :rtype: [type]
         """
-        
         inducing_points = x[..., :self.num_inducing, :]
         inputs = x[..., self.num_inducing:, :]
         
@@ -98,16 +97,13 @@ class DeeplGraphGPLayer(DeepGPLayer):
 
         # This will be of shape [num_output_dim, nx, nx] -> Prohibitive for big nx
         covar_xx_full = self.covar_module(inputs).evaluate()
-
         # This will be of shape [num_output_dim, nx, nz] -> Prohibitive for big nx
         covar_xz_full = self.covar_module(inputs, inducing_points).evaluate()
-
         # covar_xx = (I+D)^{-1} (A+I) K_xx (A+I)^top (I+D)^{-1}
         # First compute  (I+D)^{-1} (A+I) @ K_xx
         xx_t1 = self.sparse_adj_matmul(adj_mat_filled_diag, covar_xx_full)
         # Then compute  (I+D)^{-1} (A+I) @ ((A+I) @ K_xx).T = (A+I) @ K_xx @ (A+I).T
         xx_t2 = self.sparse_adj_matmul(adj_mat_filled_diag, xx_t1.transpose(-2, -1))
-
         # covar_xz = (I+D)^{-1} (A+I) K_xz
         xz_t1 = self.sparse_adj_matmul(adj_mat_filled_diag, covar_xz_full)
         
@@ -244,8 +240,44 @@ class DeepGraphGP(DeepGP):
             )
 
     def forward(self, x, g, x_inds=None):
-        h = x
-        for i, layer in enumerate(self.layers):
-            with gpytorch.settings.num_likelihood_samples(self.num_likelihood_samples):
-                h = layer(h, g=g, x_inds=x_inds) if i == len(self.layers)-1 else layer(h, g=g)
+        """
+        See: https://docs.dgl.ai/guide/minibatch-node.html#guide-minibatch-node-classification-sampler 
+        for stochastic training with mini-batch subsampling in large graphs
+
+        # This sampler samples for "multiple-layer" of neighbor hoods
+        sampler = dgl.dataloading.MultiLayerFullNeighborSampler(n_layers)
+
+        dataloader = dgl.dataloading.NodeDataLoader(
+            g, train_inds, sampler,
+            batch_size=32,
+            shuffle=True,
+            drop_last=False,
+            num_workers=1)
+
+        input_nodes, output_nodes, blocks = next(iter(dataloader))
+        where
+        blocks is a list of graphs of decreasing size (narrowing neighborhood)
+
+        :param x: [description]
+        :type x: [type]
+        :param g: [description]
+        :type g: [type]
+        :param x_inds: [description], defaults to None
+        :type x_inds: [type], optional
+        :return: [description]
+        :rtype: [type]
+        """
+        if isinstance(g, list): # If g is given as blocks
+            assert(len(g) == len(self.layers)) # The number of layers must match
+            h = x
+            for i, layer in enumerate(self.layers):
+                num_output = g[i]._node_frames[1]["_ID"].shape[0]
+                h = layer(h, g=g[i], x_inds=torch.arange(num_output))
+                print("layer", i, "h =", h)
+
+        else:
+            h = x
+            for i, layer in enumerate(self.layers):
+                with gpytorch.settings.num_likelihood_samples(self.num_likelihood_samples):
+                    h = layer(h, g=g, x_inds=x_inds) if i == len(self.layers)-1 else layer(h, g=g)
         return h
