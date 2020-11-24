@@ -100,6 +100,9 @@ class VariationalGraphGP(ApproximateGP):
         adj_mat_filled_diag = SparseTensor.from_torch_sparse_coo_tensor(g.adjacency_matrix(False)).fill_diag(1.)
         adj_mat_filled_diag = adj_mat_filled_diag / adj_mat_filled_diag.sum(-1).unsqueeze(-1) # Divide each row by (1+di)
 
+        if torch.cuda.is_available() and inputs.is_cuda:
+            adj_mat_filled_diag = adj_mat_filled_diag.cuda()
+
         # This will be of shape [num_output_dim, nx, nx] -> Prohibitive for big nx
         covar_xx_full = self.covar_module(inputs).evaluate()
 

@@ -95,12 +95,16 @@ class DeeplGraphGPLayer(DeepGPLayer):
         adj_mat_filled_diag = SparseTensor.from_torch_sparse_coo_tensor(g.adjacency_matrix(False)).fill_diag(1.)
         adj_mat_filled_diag = adj_mat_filled_diag / adj_mat_filled_diag.sum(-1).unsqueeze(-1) # Divide each row by (1+di)
 
+        if torch.cuda.is_available() and inputs.is_cuda:
+            adj_mat_filled_diag = adj_mat_filled_diag.cuda()
+
         # This will be of shape [num_output_dim, nx, nx] -> Prohibitive for big nx
         covar_xx_full = self.covar_module(inputs).evaluate()
         # This will be of shape [num_output_dim, nx, nz] -> Prohibitive for big nx
         covar_xz_full = self.covar_module(inputs, inducing_points).evaluate()
         # covar_xx = (I+D)^{-1} (A+I) K_xx (A+I)^top (I+D)^{-1}
         # First compute  (I+D)^{-1} (A+I) @ K_xx
+
         xx_t1 = self.sparse_adj_matmul(adj_mat_filled_diag, covar_xx_full)
         # Then compute  (I+D)^{-1} (A+I) @ ((A+I) @ K_xx).T = (A+I) @ K_xx @ (A+I).T
         xx_t2 = self.sparse_adj_matmul(adj_mat_filled_diag, xx_t1.transpose(-2, -1))
@@ -241,10 +245,13 @@ class DeepGraphGP(DeepGP):
 
     def forward(self, x, g, x_inds=None):
         """
+        
+        Supports stochastic training for large graphs
+        
         See: https://docs.dgl.ai/guide/minibatch-node.html#guide-minibatch-node-classification-sampler 
         for stochastic training with mini-batch subsampling in large graphs
 
-        # This sampler samples for "multiple-layer" of neighbor hoods
+        This sampler samples for "multiple-layer" of neighbor hoods
         sampler = dgl.dataloading.MultiLayerFullNeighborSampler(n_layers)
 
         dataloader = dgl.dataloading.NodeDataLoader(
@@ -267,13 +274,26 @@ class DeepGraphGP(DeepGP):
         :return: [description]
         :rtype: [type]
         """
-        if isinstance(g, list): # If g is given as blocks
+        def find(tensor, values):
+            """Helper function: given a tensor and specified values
+            Find for each value, the index of the first element == value
+
+            :param tensor: [description]
+            :type tensor: [type]
+            :param values: [description]
+            :type values: [type]
+            :return: [description]
+            :rtype: [type]
+            """
+            return torch.nonzero(tensor[..., None] == values)[:, 1]
+
+        if isinstance(g, list): # If g is given as blocks from RandomGraphSampling
             assert(len(g) == len(self.layers)) # The number of layers must match
             h = x
             for i, layer in enumerate(self.layers):
                 num_output = g[i]._node_frames[1]["_ID"].shape[0]
-                h = layer(h, g=g[i], x_inds=torch.arange(num_output))
-                print("layer", i, "h =", h)
+                h = layer(h, g=g[i], # The pick x_inds as the index of the nodes to output
+                    x_inds=find(g[i]._node_frames[0]["_ID"], g[i]._node_frames[1]["_ID"]))
 
         else:
             h = x
