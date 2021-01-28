@@ -4,7 +4,7 @@ import gpytorch
 from torch.nn import Linear
 from gpytorch.means import ConstantMean, LinearMean
 from gpytorch.kernels import RBFKernel, ScaleKernel
-from gpytorch.variational import VariationalStrategy, CholeskyVariationalDistribution
+from gpytorch.variational import VariationalStrategy, CholeskyVariationalDistribution, BatchDecoupledVariationalStrategy
 from gpytorch.distributions import MultivariateNormal, MultitaskMultivariateNormal
 from gpytorch.models import ApproximateGP, GP
 from gpytorch.mlls import VariationalELBO, AddedLossTerm
@@ -13,10 +13,11 @@ from gpytorch.models.deep_gps import DeepGPLayer, DeepGP
 from gpytorch.mlls import DeepApproximateMLL
 from torch_sparse.tensor import SparseTensor
 from gpytorch.lazy import BlockDiagLazyTensor
+from gpytorch.variational import MeanFieldVariationalDistribution
+from gpytorch.models.deep_gps.dspp import DSPPLayer, DSPP
 
-
-class DeeplGraphGPLayer(DeepGPLayer):
-    def __init__(self, inducing_points, in_dim, out_dim=None, mean=None, covar=None, is_output_layer=True):
+class GraphDSPPLayer(DSPPLayer):
+    def __init__(self, inducing_points, in_dim, out_dim=None, Q=8, mean=None, covar=None):
         """[summary]
 
         :param inducing_points: [description]
@@ -38,9 +39,13 @@ class DeeplGraphGPLayer(DeepGPLayer):
         else:
             batch_shape = torch.Size([out_dim])
         
-        variational_distribution = CholeskyVariationalDistribution(
-            inducing_points.size(-2), 
-            batch_shape=batch_shape
+        # variational_distribution = CholeskyVariationalDistribution(
+        #     inducing_points.size(-2), 
+        #     batch_shape=batch_shape
+        # )
+        variational_distribution = MeanFieldVariationalDistribution(
+            num_inducing_points=inducing_points.size(-2),
+            batch_shape=torch.Size([out_dim]) if out_dim is not None else torch.Size([])
         )
 
         # Seems like it might be better to use independent multitask for single layer GP
@@ -52,14 +57,13 @@ class DeeplGraphGPLayer(DeepGPLayer):
             learn_inducing_locations=True
         )
 
-        super(DeeplGraphGPLayer, self).__init__(
-            variational_strategy, in_dim, out_dim)
+        super(GraphDSPPLayer, self).__init__(
+            variational_strategy, in_dim, out_dim, Q)
 
+        # TODO: make this modifiable
         self.mean_module =  gpytorch.means.LinearMean(in_dim, batch_shape=torch.Size([out_dim]))if mean is None else mean
         self.covar_module = gpytorch.kernels.PolynomialKernel(power=4, batch_shape=batch_shape) if covar is None else covar
-
         self.num_inducing = inducing_points.size(-2)
-        self.is_output_layer = is_output_layer
 
     def sparse_adj_matmul(self, adj, v):
         """[summary]
@@ -147,83 +151,16 @@ class DeeplGraphGPLayer(DeepGPLayer):
 
         return gpytorch.distributions.MultivariateNormal(mean_full, covar_full)
 
-    def __call__(self, inputs, are_samples=False, **kwargs):
-        """Pass data through this hidden GP layer. The output is a MultitaskMultivariateNormal distribution
-        (or MultivariateNormal distribution is output_dims=None).
 
-        If the input is >=2 dimensional Tensor (e.g. `n x d`), we pass the input through each hidden GP,
-        resulting in a `n x h` multitask Gaussian distribution (where all of the `h` tasks represent an
-        output dimension and are independent from one another).  We then draw `s` samples from these Gaussians,
-        resulting in a `s x n x h` MultitaskMultivariateNormal distribution.
-
-        If the input is a >=3 dimensional Tensor, and the `are_samples=True` kwarg is set, then we assume that
-        the outermost batch dimension is a samples dimension. The output will have the same number of samples.
-        For example, a `s x b x n x d` input will result in a `s x b x n x h` MultitaskMultivariateNormal distribution.
-
-        The goal of these last two points is that if you have a tensor `x` that is `n x d`, then
-
-            >>> hidden_gp2(hidden_gp(x))
-
-        will just work, and return a tensor of size `s x n x h2`, where `h2` is the output dimensionality of
-        hidden_gp2. In this way, hidden GP layers are easily composable.
-
-        :param inputs: [description]
-        :type inputs: [type]
-        :param are_samples: [description], defaults to False
-        :type are_samples: bool, optional
-        :raises ValueError: [description]
-        :raises RuntimeError: [description]
-        :return: [description]
-        :rtype: [type]
-        """
-
-        # print(inputs.shape)
-        deterministic_inputs = not are_samples
-        if isinstance(inputs, MultitaskMultivariateNormal):
-            inputs = torch.distributions.Normal(loc=inputs.mean, scale=inputs.variance.sqrt()).rsample()
-            deterministic_inputs = False
-            
-        if gpytorch.settings.debug.on():
-            if not torch.is_tensor(inputs):
-                raise ValueError(
-                    "`inputs` should either be a MultitaskMultivariateNormal or a Tensor, got "
-                    f"{inputs.__class__.__Name__}"
-                )
-
-            if inputs.size(-1) != self.input_dims:
-                raise RuntimeError(
-                    f"Input shape did not match self.input_dims. Got total feature dims [{inputs.size(-1)}],"
-                    f" expected [{self.input_dims}]"
-                )
-
-        # Repeat the input for all possible outputs
-        if self.output_dims is not None:
-            inputs = inputs.unsqueeze(-3)
-            inputs = inputs.expand(*inputs.shape[:-3], self.output_dims, *inputs.shape[-2:])
-
-        # Now run samples through the GP
-        output = self.variational_strategy(inputs, **kwargs)
-
-        if (self.output_dims is not None) and not self.is_output_layer:
-            mean = output.loc.transpose(-1, -2)
-            covar = BlockDiagLazyTensor(output.lazy_covariance_matrix, block_dim=-3)
-            output = MultitaskMultivariateNormal(mean, covar, interleaved=False)
-
-        # Maybe expand inputs?
-        if deterministic_inputs and not self.is_output_layer:
-            output = output.expand(torch.Size([gpytorch.settings.num_likelihood_samples.value()])
-                + output.batch_shape)
-        
-        return output
-
-
-class DeepGraphGP(DeepGP):
+class DeepGraphSigmaPointProcesses(DSPP):
     def __init__(self, input_dim, first_layer_inducing_points=None,
-                output_dim=None, num_inducing=128,
+                output_dim=None, num_inducing=128, Q=8,
                 num_likelihood_samples=10,
+                kernel_name="PolynomialKernel",
+                kernel_params={},
                 layer_dims=[10, 10]):
         
-        super().__init__()
+        super().__init__(Q)
 
         self.layers = torch.nn.ModuleList()
         layer_input_out_dims = list(zip(
@@ -243,12 +180,14 @@ class DeepGraphGP(DeepGP):
             else:
                 inducing_points = torch.randn(out_dim, num_inducing, in_dim)
             
-            # Add to layer
+            # Add layer
+            kernel_params["batch_shape"] = torch.Size([out_dim])
+            if kernel_name == "PolynomialKernel":
+                kernel_params["power"] = 3
+            covar_func = getattr(gpytorch.kernels, kernel_name)(**kernel_params)
+
             self.layers.append(
-                DeeplGraphGPLayer(inducing_points, in_dim=in_dim, out_dim=out_dim,
-                    # Set the last layer as output layer of course
-                    is_output_layer=True if layer_ind == num_layers-1 else False
-                )
+                GraphDSPPLayer(inducing_points, in_dim=in_dim, out_dim=out_dim, Q=Q, covar=covar_func)
             )
 
     def forward(self, x, g, x_inds=None):
@@ -310,3 +249,27 @@ class DeepGraphGP(DeepGP):
                     h = layer(h, g=g, x_inds=x_inds) if i == len(self.layers)-1 else layer(h, g=g)
 
         return h
+
+
+    def predict(self, x, blocks, likelihood, x_inds=None):
+        # TODO: modify this to match graph input
+        with settings.fast_computations(log_prob=False, solves=False), torch.no_grad():
+            preds = likelihood(self(x, g=blocks, x_inds=x_inds, mean_input=x))
+            mu = preds.mean.cpu()
+            var = preds.variance.cpu()
+
+            # Compute test log probability. The output of a DSPP is a weighted mixture of Q Gaussians,
+            # with the Q weights specified by self.quad_weight_grid. The below code computes the log probability of each
+            # test point under this mixture.
+
+            # Step 1: Get log marginal for each Gaussian in the output mixture.
+            base_batch_ll = likelihood.log_marginal(y_batch, self(x))
+
+            # Step 2: Weight each log marginal by its quadrature weight in log space.
+            deep_batch_ll = self.quad_weights.unsqueeze(-1) + base_batch_ll
+
+            # Step 3: Take logsumexp over the mixture dimension, getting test log prob for each datapoint in the batch.
+            batch_log_prob = deep_batch_ll.logsumexp(dim=0)
+            ll = batch_log_prob.cpu()
+
+            return mu, var, ll

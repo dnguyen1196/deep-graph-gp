@@ -1,17 +1,8 @@
 import torch
-import numpy as np
-import dgl
 import gpytorch
-from gpytorch.kernels import RBFKernel, ScaleKernel
-from gpytorch.means import ConstantMean, LinearMean
 from gpytorch.variational import CholeskyVariationalDistribution
 from gpytorch.variational import VariationalStrategy, IndependentMultitaskVariationalStrategy
-from gpytorch.distributions import MultivariateNormal, MultitaskMultivariateNormal
-from gpytorch.lazy import lazify
 from torch_sparse.tensor import SparseTensor
-from gpytorch.models.deep_gps import DeepGPLayer
-from gpytorch import settings
-from gpytorch.lazy import BlockDiagLazyTensor
 from gpytorch.models import ApproximateGP
 
 """
@@ -60,8 +51,9 @@ class VariationalGraphGP(ApproximateGP):
 
         super(VariationalGraphGP, self).__init__(variational_strategy)
 
-        self.mean_module = gpytorch.means.ConstantMean(batch_shape=batch_shape) if mean is None else mean
-        self.covar_module = gpytorch.kernels.PolynomialKernel(power=3, batch_shape=batch_shape) if covar is None else covar
+        # self.mean_module = gpytorch.means.ConstantMean(batch_shape=batch_shape) if mean is None else mean
+        self.mean_module =  gpytorch.means.LinearMean(in_dim, batch_shape=torch.Size([out_dim])) if mean is None else mean
+        self.covar_module = gpytorch.kernels.PolynomialKernel(power=4, batch_shape=batch_shape) if covar is None else covar
         self.num_inducing = inducing_points.size(-2)
         self.is_output_layer = is_output_layer
 
@@ -137,11 +129,20 @@ class VariationalGraphGP(ApproximateGP):
                 torch.cat([covar_xz, covar_xx], dim=-1)
             ], dim=-2)).add_jitter(1e-3)
         
-        if x_inds is None:
-            mean_full = self.mean_module(x)
-        else:
-            mean_full = self.mean_module(torch.cat([
-                inducing_points, inputs[..., x_inds, :]
-            ], dim=-2))
+
+        mean_z = self.mean_module(inducing_points)
+        mean_x = self.mean_module(inputs)
+
+        mean_x = mean_x.unsqueeze(-1)
+        mean_x = self.sparse_adj_matmul(adj_mat_filled_diag, mean_x)
+
+        mean_x = mean_x.squeeze(-1)
+
+        if x_inds is not None:
+            mean_x = mean_x[..., x_inds]
+        
+        mean_full = torch.cat([
+                mean_z, mean_x
+            ], dim=-1)
 
         return gpytorch.distributions.MultivariateNormal(mean_full, covar_full)

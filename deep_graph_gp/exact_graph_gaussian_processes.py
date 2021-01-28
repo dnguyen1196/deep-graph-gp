@@ -5,6 +5,8 @@ import gpytorch
 from gpytorch.models import ExactGP
 from gpytorch.distributions import MultivariateNormal
 from gpytorch.lazy import lazify, delazify
+from torch_sparse.tensor import SparseTensor
+
 
 class ExactGraphGP(ExactGP):
     def __init__(self, likelihood, mean, kernel):
@@ -12,29 +14,40 @@ class ExactGraphGP(ExactGP):
         self.mean_module = mean
         self.covar_module = kernel
 
-    def forward(self, g, x=None):
+
+    def sparse_adj_matmul(self, adj, v):
+        """[summary]
+
+        :param adj: [description]
+        :type adj: [type]
+        :param v: [description]
+        :type v: [type]
+        :return: [description]
+        :rtype: [type]
+        """
+        return adj.matmul(v)
+
+    def forward(self, x, g, **kwargs):
         """
 
         """
-        if x is None:
-            x = g.ndata["h"]
+        # Pre-compute (I+D)^{-1} (A+I) (multiply each row of A+I with (1+di)^-1)
+        adj_mat_filled_diag = SparseTensor.from_torch_sparse_coo_tensor(g.adjacency_matrix(False)).fill_diag(1.)
+        adj_mat_filled_diag = adj_mat_filled_diag / adj_mat_filled_diag.sum(-1).unsqueeze(-1) # Divide each row by (1+di)
 
-        mean = self.mean_module(x)
-        cov  = self.covar_module(x)
-        cov.add_jitter()
+        if torch.cuda.is_available() and x.is_cuda:
+            adj_mat_filled_diag = adj_mat_filled_diag.cuda()
 
-        adj = g.adjacency_matrix(False) # Adjacency matrix
-        d   = g.out_degrees().float() # Degree vector
-        n   = adj.shape[0]    # Number of vertices
+        # This will be of shape [num_output_dim, nx, nx] -> Prohibitive for big nx
+        covar_xx = self.covar_module(x).evaluate()
 
-        a_plus_i = torch.eye(n) + adj
-        m = torch.matmul(a_plus_i, mean.view(mean.numel(),1))
-        m /= (d.view(d.numel(),1) + 1.)
+        # covar_xx = (I+D)^{-1} (A+I) K_xx (A+I)^top (I+D)^{-1}
+        # First compute  (I+D)^{-1} (A+I) @ K_xx
+        xx_t1 = self.sparse_adj_matmul(adj_mat_filled_diag, covar_xx)
+        # Then compute  (I+D)^{-1} (A+I) @ ((A+I) @ K_xx).T = (A+I) @ K_xx @ (A+I).T
+        covar_full = self.sparse_adj_matmul(adj_mat_filled_diag, xx_t1.transpose(-2, -1))
 
-        S = delazify(cov)
-
-        S = torch.matmul(a_plus_i, torch.matmul(S, a_plus_i.T))
-        # print(S)
-        # print(torch.cholesky(S))
-        S = S * (torch.ger(1./(d+1.), 1./(d+1.)))
-        return MultivariateNormal(m, S)
+        mean_full = self.mean_module(x)
+        mean_full = self.sparse_adj_matmul(adj_mat_filled_diag, mean_full)
+        
+        return gpytorch.distributions.MultivariateNormal(mean_full, covar_full)

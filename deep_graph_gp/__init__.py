@@ -2,5 +2,7 @@ import deep_graph_gp
 import deep_graph_gp.data
 from deep_graph_gp.exact_graph_gaussian_processes import ExactGraphGP
 from deep_graph_gp.variational_graph_gaussian_processes import VariationalGraphGP
-from deep_graph_gp.sparse_graph_gaussian_processes import SparseGraphGP
 from deep_graph_gp.deep_graph_gaussian_processes import DeepGraphGP
+from deep_graph_gp.deep_graph_kernels import DeepGraphKernel
+from deep_graph_gp.graph_neural_networks import DeepGraphNeuralNetwork
+from deep_graph_gp.deep_graph_sigma_point_processes import DeepGraphSigmaPointProcesses
